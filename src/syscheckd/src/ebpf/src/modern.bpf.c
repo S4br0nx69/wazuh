@@ -550,15 +550,23 @@ int kprobe__vfs_unlink(struct pt_regs *ctx)
 * files. Only invoked when "bpf" is part of the active LSM list
 * (CONFIG_LSM= or kernel cmdline lsm=...,bpf). The user-space loader
 * disables autoload of this program when BPF LSM is not active.
+*
+* Two variants of this hook are shipped:
+*   - file_open_dpath: uses bpf_d_path(), which gives namespace-correct
+*     paths (overlayfs, mount namespaces, deleted-file markers) but is
+*     restricted by the kernel's btf_allowlist_d_path / sleepable-hook
+*     list. The userspace loader prefers this variant.
+*   - file_open_walk: uses get_path_str_from_path() (a manual dentry
+*     walker). Available on every kernel; less namespace-aware. Used
+*     as a fallback when the loader detects that the _dpath variant
+*     fails to load (e.g. Amazon Linux 2 / 2023).
+*
+* Both share the same SEC so they attach to the same LSM hook. Only
+* one is loaded at a time — the loader disables autoload on the other.
 */
-SEC("lsm/file_open")
-int BPF_PROG(file_open, struct file *file)
+static __always_inline bool file_open_filter(struct file *file,
+                                             struct inode **out_inode)
 {
-    struct path *path = NULL;
-    bpf_probe_read_kernel(&path, sizeof(path), &file->f_path);
-    if (!path)
-        return 0;
-
     fmode_t f_mode = 0;
     bpf_probe_read_kernel(&f_mode, sizeof(f_mode), &file->f_mode);
 
@@ -567,23 +575,28 @@ int BPF_PROG(file_open, struct file *file)
 
     /* Report on creation OR on any non-read-only open (writes / rw / append). */
     if (!(f_mode & FMODE_CREATED) && !(f_flags & O_CREAT) && !(f_flags & O_ACCMODE)) {
-        return 0;
+        return false;
     }
-
-    struct dentry *dentry = NULL;
-    bpf_probe_read_kernel(&dentry, sizeof(dentry), &path->dentry);
-    if (!dentry)
-        return 0;
 
     struct inode *f_inode = NULL;
     bpf_probe_read_kernel(&f_inode, sizeof(f_inode), &file->f_inode);
     if (!f_inode)
-        return 0;
+        return false;
 
     __u32 mode = 0;
     bpf_probe_read_kernel(&mode, sizeof(mode), &f_inode->i_mode);
-
     if (((mode & 00170000) != 0100000))
+        return false;
+
+    *out_inode = f_inode;
+    return true;
+}
+
+SEC("lsm/file_open")
+int BPF_PROG(file_open_dpath, struct file *file)
+{
+    struct inode *f_inode = NULL;
+    if (!file_open_filter(file, &f_inode))
         return 0;
 
     char *full_path = bpf_map_lookup_elem(&full_path_map, &(u32){0});
@@ -601,23 +614,60 @@ int BPF_PROG(file_open, struct file *file)
     return 0;
 }
 
+SEC("lsm/file_open")
+int BPF_PROG(file_open_walk, struct file *file)
+{
+    struct inode *f_inode = NULL;
+    if (!file_open_filter(file, &f_inode))
+        return 0;
+
+    struct buffer *string_buf = bpf_map_lookup_elem(&heaps_map, &(u32){0});
+    if (!string_buf)
+        return 0;
+
+    u8 *full_path = NULL;
+    if (get_path_str_from_path(&full_path, &file->f_path, string_buf) < 0)
+        return 0;
+
+    __u64 inode = 0, dev = 0;
+    get_inode_dev(f_inode, &inode, &dev);
+
+    submit_event((const char *)full_path, inode, dev);
+    return 0;
+}
+
 
 /*
 * LSM hook for path-based unlink. Same activation rules as lsm/file_open.
 * Requires CONFIG_SECURITY_PATH=y in the running kernel.
 */
-SEC("lsm/path_unlink")
-int BPF_PROG(path_unlink, struct path *path, struct dentry *dentry)
+/*
+* LSM hook for path-based unlink. Two variants are shipped for the
+* same reasons described above on lsm/file_open. Requires
+* CONFIG_SECURITY_PATH=y in the running kernel.
+*/
+static __always_inline bool path_unlink_filter(struct dentry *dentry,
+                                               struct inode **out_inode)
 {
     struct inode *d_inode = NULL;
     bpf_probe_read_kernel(&d_inode, sizeof(d_inode), &dentry->d_inode);
     if (!d_inode)
-        return 0;
+        return false;
 
     __u32 mode = 0;
     bpf_probe_read_kernel(&mode, sizeof(mode), &d_inode->i_mode);
-
     if (((mode & 00170000) != 0100000))
+        return false;
+
+    *out_inode = d_inode;
+    return true;
+}
+
+SEC("lsm/path_unlink")
+int BPF_PROG(path_unlink_dpath, struct path *path, struct dentry *dentry)
+{
+    struct inode *d_inode = NULL;
+    if (!path_unlink_filter(dentry, &d_inode))
         return 0;
 
     char *dir_path = bpf_map_lookup_elem(&full_path_map, &(u32){0});
@@ -640,6 +690,45 @@ int BPF_PROG(path_unlink, struct path *path, struct dentry *dentry)
     u8 *full_path = NULL;
     ret = concat_strings_bpf(&full_path, dir_path, file_name_ptr, string_buf);
     if (ret < 0)
+        return 0;
+
+    __u64 inode = 0, dev = 0;
+    get_inode_dev(d_inode, &inode, &dev);
+
+    submit_event((const char *)full_path, inode, dev);
+    return 0;
+}
+
+SEC("lsm/path_unlink")
+int BPF_PROG(path_unlink_walk, struct path *path, struct dentry *dentry)
+{
+    struct inode *d_inode = NULL;
+    if (!path_unlink_filter(dentry, &d_inode))
+        return 0;
+
+    /*
+     * Build a path from the unlink target dentry plus the parent
+     * mount, then walk it manually via get_path_str_from_path. That
+     * walks d_parent up to root and yields the absolute file path
+     * without relying on bpf_d_path (which is not allowed for
+     * bpf_lsm_path_unlink on e.g. Amazon Linux 2 / 2023).
+     */
+    struct vfsmount *mnt = NULL;
+    bpf_probe_read_kernel(&mnt, sizeof(mnt), &path->mnt);
+    if (!mnt)
+        return 0;
+
+    struct path file_path = {
+        .dentry = dentry,
+        .mnt    = mnt,
+    };
+
+    struct buffer *string_buf = bpf_map_lookup_elem(&heaps_map, &(u32){0});
+    if (!string_buf)
+        return 0;
+
+    u8 *full_path = NULL;
+    if (get_path_str_from_path(&full_path, &file_path, string_buf) < 0)
         return 0;
 
     __u64 inode = 0, dev = 0;
