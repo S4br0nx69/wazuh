@@ -1095,11 +1095,16 @@ bool SecurityConfigurationAssessment::synchronizeDatabaseSnapshot(bool increaseV
             m_dBSync->increaseEachEntryVersion("sca_check");
         }
 
+        // Exclude "Not run" rows from the snapshot. Pre-timeout-support this was
+        // only the transient pre-scan placeholder (already gone by the time we get
+        // here per #35305); now a timed-out check legitimately stays at "Not run"
+        // after the scan, and we don't want those rows leaking to the manager —
+        // it should keep the last known executed state instead.
         std::vector<nlohmann::json> checks;
         auto selectQuery = SelectQuery::builder()
                            .table("sca_check")
                            .columnList({"*"})
-                           .rowFilter("WHERE sync = 1")
+                           .rowFilter("WHERE sync = 1 AND result != 'Not run'")
                            .build();
 
         const auto selectCallback = [&checks](ReturnTypeCallback returnTypeCallback, const nlohmann::json & resultData)

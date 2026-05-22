@@ -73,7 +73,9 @@ void SCAPolicy::Scan(
             }
 
             const auto result = resultEvaluator.Result();
-            const auto& reason = (result == sca::CheckResult::NotApplicable) ? resultEvaluator.GetInvalidReason() : std::string{};
+            const auto& reason = (result == sca::CheckResult::NotApplicable || result == sca::CheckResult::NotRun)
+                                 ? resultEvaluator.GetInvalidReason()
+                                 : std::string{};
 
             // NOLINTBEGIN(bugprone-unchecked-optional-access)
             LoggingHelper::getInstance().log(
