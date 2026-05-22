@@ -18,6 +18,11 @@
 #include "syscheck.h"
 #include "startup_gate_op.h"
 
+#ifdef __APPLE__
+#include <pwd.h>
+#include <dirent.h>
+#endif
+
 #ifndef WIN32
 
 #define Q(x) #x
@@ -183,6 +188,37 @@ int main(int argc, char **argv)
         nowDaemon();
         goDaemon();
     }
+
+#ifdef __APPLE__
+    /* Force TCC enrolment of wazuh-syscheckd while we still hold a clean
+     * launchd-driven attribution. tccd records the FDA entry under whichever
+     * binary triggers the first opendir() on a protected user folder; if we
+     * defer it until merged.mg arrives and wazuh-modulesd re-spawns us, the
+     * entry gets recorded under modulesd instead and wazuh-syscheckd never
+     * appears in System Settings > Privacy & Security > Full Disk Access.
+     * The opendir is expected to be denied with EACCES — the denial IS the
+     * event that creates the FDA list entry. Must run BEFORE
+     * startup_gate_wait_for_ready, because the gate blocks until merged.mg
+     * arrives, by which time modulesd has already issued the reload that
+     * would contaminate the responsible_path. */
+    {
+        setpwent();
+        struct passwd *pw;
+        while ((pw = getpwent()) != NULL) {
+            if (pw->pw_uid < 500) continue;        /* skip system / hidden accounts */
+            if (!pw->pw_dir || !*pw->pw_dir) continue;
+            char probe_path[PATH_MAX];
+            if (snprintf(probe_path, sizeof(probe_path), "%s/Downloads", pw->pw_dir) >= (int)sizeof(probe_path)) {
+                continue;
+            }
+            DIR *probe = opendir(probe_path);
+            if (probe != NULL) {
+                closedir(probe);
+            }
+        }
+        endpwent();
+    }
+#endif
 
     /* Start signal handling */
     StartSIG2(ARGV0, fim_shutdown);
