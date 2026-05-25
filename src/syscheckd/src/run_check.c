@@ -893,6 +893,12 @@ void * fim_run_integrity(__attribute__((unused)) void * args) {
     bool first_sync_completed = fim_db_get_last_sync_time(FIM_FIRST_SYNC_COMPLETED_METADATA_KEY) > 0;
     bool skip_initial_wait = !first_sync_completed;
 
+    // Prime the atomic so restarts on an already-synced agent report first_sync_completed=true
+    // immediately to agent-info's is_pause_completed query.
+    if (first_sync_completed) {
+        atomic_int_set(&syscheck.fim_first_sync_completed, 1);
+    }
+
 #ifdef WIN32
     int table_count = 3;
     char* table_names[3] = {FIMDB_FILE_TABLE_NAME, FIMDB_REGISTRY_KEY_TABLENAME, FIMDB_REGISTRY_VALUE_TABLENAME};
@@ -959,6 +965,7 @@ void * fim_run_integrity(__attribute__((unused)) void * args) {
             if (sync_result && !first_sync_completed) {
                 fim_db_update_last_sync_time_value(FIM_FIRST_SYNC_COMPLETED_METADATA_KEY, (int64_t)time(NULL));
                 first_sync_completed = true;
+                atomic_int_set(&syscheck.fim_first_sync_completed, 1);
             }
         } else {
             // Take a snapshot of the current directories list to avoid holding the lock during integrity checks.
@@ -989,6 +996,7 @@ void * fim_run_integrity(__attribute__((unused)) void * args) {
                 if (!first_sync_completed) {
                     fim_db_update_last_sync_time_value(FIM_FIRST_SYNC_COMPLETED_METADATA_KEY, (int64_t)time(NULL));
                     first_sync_completed = true;
+                    atomic_int_set(&syscheck.fim_first_sync_completed, 1);
                 }
 
                 for (int i = 0; i < table_count; i++) {
